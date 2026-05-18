@@ -21,8 +21,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -77,11 +77,58 @@ func wsURL(bifrostURL, apiKey string) string {
 	return u + "/agent/stream/websocket?vsn=2.0.0&token=" + apiKey
 }
 
-func dial(ctx context.Context, apiKey, target string) (*websocket.Conn, error) {
-	_, err := url.Parse(target)
+// phoenixJoin sends a phx_join to topic `agent:<agent_id>` after WS upgrade.
+// Phoenix Channels v2 protocol: client must join a topic before events flow,
+// else server closes with code 1002 protocol-error.
+//
+// Resolves agent_id by querying /auth/whoami with the api_key.
+func phoenixJoin(c *websocket.Conn, apiKey, bifrostURL string) error {
+	body, code, err := bifrostGET(apiKey, bifrostURL, "/auth/whoami")
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("/auth/whoami: %w", err)
 	}
+	if code != 200 {
+		return fmt.Errorf("/auth/whoami status=%d body=%s", code, body)
+	}
+	var whoami struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(body), &whoami); err != nil {
+		return fmt.Errorf("whoami parse: %w", err)
+	}
+	agentID := whoami.Name
+	if agentID == "" {
+		return fmt.Errorf("whoami returned empty name")
+	}
+	// Allow override via env (matches BIFROST_AGENT_ID semantics).
+	if envID := os.Getenv("BIFROST_AGENT_ID"); envID != "" {
+		agentID = envID
+	}
+	// Phoenix Channels v2 message: ["join_ref", "msg_ref", "topic", "event", payload]
+	msg := []any{"1", "1", "agent:" + agentID, "phx_join", map[string]any{}}
+	if err := c.WriteJSON(msg); err != nil {
+		return fmt.Errorf("write phx_join: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "[bifrost-channel] joined topic agent:"+agentID)
+	return nil
+}
+
+func bifrostGET(apiKey, baseURL, path string) (string, int, error) {
+	req, err := http.NewRequest("GET", baseURL+path, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b), resp.StatusCode, nil
+}
+
+func dial(ctx context.Context, apiKey, target string) (*websocket.Conn, error) {
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+apiKey)
 	c, _, err := websocket.DefaultDialer.DialContext(ctx, target, header)
@@ -100,6 +147,11 @@ func runMonitor(ctx context.Context, apiKey, bifrostURL string) {
 		os.Exit(1)
 	}
 	defer c.Close()
+
+	if err := phoenixJoin(c, apiKey, bifrostURL); err != nil {
+		fmt.Fprintln(os.Stderr, "[bifrost-channel] phx_join failed:", err)
+		os.Exit(1)
+	}
 
 	go func() {
 		t := time.NewTicker(30 * time.Second)
@@ -153,6 +205,11 @@ func runStopHook(ctx context.Context, apiKey, bifrostURL string) {
 		return
 	}
 	defer c.Close()
+
+	if err := phoenixJoin(c, apiKey, bifrostURL); err != nil {
+		fmt.Fprintln(os.Stderr, "[bifrost-channel] phx_join failed:", err)
+		return
+	}
 
 	type readResult struct {
 		msg []byte
