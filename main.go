@@ -129,32 +129,7 @@ func handleMCP(req jsonrpcReq, apiKey, bifrostURL string) {
 	case "notifications/initialized":
 		// no response for notifications
 	case "tools/list":
-		writeMCPResult(req.ID, map[string]any{
-			"tools": []map[string]any{
-				{
-					"name":        "debug_auth",
-					"description": "Verify the bifrost api_key works + return scope/realm info",
-					"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-				},
-				{
-					"name":        "messages_send",
-					"description": "Send a message to a channel or agent (e.g. 'zach', 'heimdall')",
-					"inputSchema": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"channel": map[string]any{"type": "string"},
-							"content": map[string]any{"type": "string"},
-						},
-						"required": []string{"channel", "content"},
-					},
-				},
-				{
-					"name":        "ping",
-					"description": "Health check — returns pong + version",
-					"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-				},
-			},
-		})
+		writeMCPResult(req.ID, map[string]any{"tools": toolSpecs()})
 	case "tools/call":
 		var params struct {
 			Name      string          `json:"name"`
@@ -167,33 +142,186 @@ func handleMCP(req jsonrpcReq, apiKey, bifrostURL string) {
 	}
 }
 
+// toolSpec maps an MCP tool name onto a REST call.
+type toolSpec struct {
+	Name        string
+	Description string
+	Method      string // "GET" or "POST"
+	Path        string // bifrost-api path, possibly with {placeholder}
+	QueryKeys   []string // arg keys forwarded as ?query
+	BodyMode    string   // "all" = whole args JSON, "" = none
+	Properties  map[string]any
+	Required    []string
+}
+
+var toolTable = []toolSpec{
+	{Name: "debug_auth", Description: "Verify api_key + return scope/realm",
+		Method: "GET", Path: "/auth/whoami",
+		Properties: map[string]any{}},
+	{Name: "ping", Description: "Health check — returns pong + version",
+		Method: "", Path: "",
+		Properties: map[string]any{}},
+	{Name: "messages_send", Description: "Send a message to a channel or agent (e.g. 'zach', 'heimdall')",
+		Method: "POST", Path: "/messages", BodyMode: "all",
+		Properties: map[string]any{
+			"channel": map[string]any{"type": "string", "description": "Channel ID or alias"},
+			"content": map[string]any{"type": "string", "description": "Message content (markdown ok)"},
+			"bot_id":  map[string]any{"type": "string", "description": "Optional bot to send as"},
+		}, Required: []string{"channel", "content"}},
+	{Name: "messages_list", Description: "List messages from a channel",
+		Method: "GET", Path: "/messages", QueryKeys: []string{"channel", "limit", "since"},
+		Properties: map[string]any{
+			"channel": map[string]any{"type": "string"},
+			"limit":   map[string]any{"type": "number"},
+			"since":   map[string]any{"type": "string"},
+		}, Required: []string{"channel"}},
+	{Name: "messages_typing", Description: "Send typing indicator",
+		Method: "POST", Path: "/typing", BodyMode: "all",
+		Properties: map[string]any{"channel": map[string]any{"type": "string"}},
+		Required: []string{"channel"}},
+	{Name: "context_dashboard", Description: "Full context dashboard — messages, runes, health",
+		Method: "GET", Path: "/context",
+		Properties: map[string]any{}},
+	{Name: "runes_list", Description: "List runes with optional filters",
+		Method: "GET", Path: "/runes", QueryKeys: []string{"status", "priority", "owner", "type", "limit"},
+		Properties: map[string]any{
+			"status":   map[string]any{"type": "string"},
+			"priority": map[string]any{"type": "number"},
+			"owner":    map[string]any{"type": "string"},
+			"limit":    map[string]any{"type": "number"},
+		}},
+	{Name: "runes_create", Description: "Create a new rune",
+		Method: "POST", Path: "/runes", BodyMode: "all",
+		Properties: map[string]any{
+			"title": map[string]any{"type": "string"},
+			"body":  map[string]any{"type": "string"},
+		}, Required: []string{"title"}},
+	{Name: "skills_search", Description: "Search skills by keyword",
+		Method: "GET", Path: "/skills", QueryKeys: []string{"q", "limit", "namespace"},
+		Properties: map[string]any{
+			"q":         map[string]any{"type": "string"},
+			"limit":     map[string]any{"type": "number"},
+			"namespace": map[string]any{"type": "string"},
+		}, Required: []string{"q"}},
+	{Name: "skills_show", Description: "Read full skill content by ID or name",
+		Method: "GET", Path: "/skills/{id}",
+		Properties: map[string]any{"id": map[string]any{"type": "string"}},
+		Required: []string{"id"}},
+	{Name: "oracle_search", Description: "Search Oracle indexed docs",
+		Method: "GET", Path: "/oracle/search", QueryKeys: []string{"q", "limit"},
+		Properties: map[string]any{"q": map[string]any{"type": "string"}, "limit": map[string]any{"type": "number"}},
+		Required: []string{"q"}},
+	{Name: "knowledge_search", Description: "Search Bifrost knowledge graph (memory + AGE)",
+		Method: "GET", Path: "/knowledge/search", QueryKeys: []string{"q", "limit"},
+		Properties: map[string]any{"q": map[string]any{"type": "string"}, "limit": map[string]any{"type": "number"}},
+		Required: []string{"q"}},
+	{Name: "sql_execute", Description: "Execute SQL against Bifrost DB (read-only recommended)",
+		Method: "POST", Path: "/admin/sql", BodyMode: "all",
+		Properties: map[string]any{
+			"query":    map[string]any{"type": "string"},
+			"database": map[string]any{"type": "string", "enum": []string{"main", "oracle", "timescale"}},
+		}, Required: []string{"query"}},
+	{Name: "subscriptions_list", Description: "List channel subscriptions",
+		Method: "GET", Path: "/subscriptions", QueryKeys: []string{"subscriber_id", "channel"},
+		Properties: map[string]any{
+			"subscriber_id": map[string]any{"type": "string"},
+			"channel":       map[string]any{"type": "string"},
+		}},
+	{Name: "queue_check", Description: "Check work-queue for assigned items",
+		Method: "GET", Path: "/queue/agent-check", QueryKeys: []string{"worker"},
+		Properties: map[string]any{"worker": map[string]any{"type": "string"}}},
+	{Name: "execute", Description: "Run JS via codemode.request() against bifrost-api. Async arrow fn returning result.",
+		Method: "POST", Path: "/admin/codemode/exec", BodyMode: "all",
+		Properties: map[string]any{"code": map[string]any{"type": "string"}},
+		Required: []string{"code"}},
+}
+
+func toolSpecs() []map[string]any {
+	out := make([]map[string]any, 0, len(toolTable))
+	for _, t := range toolTable {
+		entry := map[string]any{
+			"name":        t.Name,
+			"description": t.Description,
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": t.Properties,
+			},
+		}
+		if len(t.Required) > 0 {
+			entry["inputSchema"].(map[string]any)["required"] = t.Required
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func findToolSpec(name string) *toolSpec {
+	for i := range toolTable {
+		if toolTable[i].Name == name {
+			return &toolTable[i]
+		}
+	}
+	return nil
+}
+
 func handleToolCall(id json.RawMessage, name string, args json.RawMessage, apiKey, bifrostURL string) {
-	switch name {
-	case "ping":
+	if name == "ping" {
 		writeMCPResult(id, map[string]any{
 			"content": []map[string]any{{"type": "text", "text": "pong from bifrost-channel " + version}},
 		})
-	case "debug_auth":
-		body, code, err := bifrostGET(apiKey, bifrostURL, "/auth/whoami")
-		if err != nil {
-			writeMCPError(id, -32000, err.Error())
-			return
-		}
-		writeMCPResult(id, map[string]any{
-			"content": []map[string]any{{"type": "text", "text": fmt.Sprintf("HTTP %d\n%s", code, body)}},
-		})
-	case "messages_send":
-		body, code, err := bifrostPOST(apiKey, bifrostURL, "/messages", args)
-		if err != nil {
-			writeMCPError(id, -32000, err.Error())
-			return
-		}
-		writeMCPResult(id, map[string]any{
-			"content": []map[string]any{{"type": "text", "text": fmt.Sprintf("HTTP %d\n%s", code, body)}},
-		})
-	default:
-		writeMCPError(id, -32601, "Unknown tool: "+name)
+		return
 	}
+
+	spec := findToolSpec(name)
+	if spec == nil {
+		writeMCPError(id, -32601, "Unknown tool: "+name)
+		return
+	}
+
+	var argMap map[string]any
+	if len(args) > 0 {
+		json.Unmarshal(args, &argMap)
+	}
+
+	// Substitute {placeholder} in path with arg value.
+	path := spec.Path
+	for k, v := range argMap {
+		ph := "{" + k + "}"
+		if strings.Contains(path, ph) {
+			path = strings.Replace(path, ph, fmt.Sprintf("%v", v), -1)
+			delete(argMap, k)
+		}
+	}
+
+	// Build query string from QueryKeys.
+	if len(spec.QueryKeys) > 0 && len(argMap) > 0 {
+		q := url.Values{}
+		for _, k := range spec.QueryKeys {
+			if v, ok := argMap[k]; ok && v != nil {
+				q.Set(k, fmt.Sprintf("%v", v))
+			}
+		}
+		if len(q) > 0 {
+			path = path + "?" + q.Encode()
+		}
+	}
+
+	var body string
+	var code int
+	var err error
+	if spec.Method == "GET" {
+		body, code, err = bifrostGET(apiKey, bifrostURL, path)
+	} else {
+		body, code, err = bifrostPOST(apiKey, bifrostURL, path, args)
+	}
+
+	if err != nil {
+		writeMCPError(id, -32000, err.Error())
+		return
+	}
+	writeMCPResult(id, map[string]any{
+		"content": []map[string]any{{"type": "text", "text": fmt.Sprintf("HTTP %d\n%s", code, body)}},
+	})
 }
 
 func writeMCPResult(id json.RawMessage, result any) {
