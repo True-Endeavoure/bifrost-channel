@@ -69,10 +69,12 @@ func main() {
 	}
 }
 
-func wsURL(bifrostURL string) string {
+func wsURL(bifrostURL, apiKey string) string {
 	u := strings.Replace(bifrostURL, "https://", "wss://", 1)
 	u = strings.Replace(u, "http://", "ws://", 1)
-	return u + "/agent/stream/websocket"
+	// Phoenix Channels v2 protocol requires ?vsn=2.0.0
+	// Auth via ?token= (matches UserSocket pattern; CF passes through cleanly).
+	return u + "/agent/stream/websocket?vsn=2.0.0&token=" + apiKey
 }
 
 func dial(ctx context.Context, apiKey, target string) (*websocket.Conn, error) {
@@ -89,7 +91,7 @@ func dial(ctx context.Context, apiKey, target string) (*websocket.Conn, error) {
 // runMonitor: long-lived WS, stream events as stdout JSON lines.
 // On any disconnect: exit 1 so plugin runtime restarts us.
 func runMonitor(ctx context.Context, apiKey, bifrostURL string) {
-	target := wsURL(bifrostURL)
+	target := wsURL(bifrostURL, apiKey)
 	fmt.Fprintln(os.Stderr, "[bifrost-channel] --monitor", version, "→", target)
 
 	c, err := dial(ctx, apiKey, target)
@@ -139,7 +141,7 @@ func runMonitor(ctx context.Context, apiKey, bifrostURL string) {
 
 // runStopHook: short-lived WS, block up to 5min on first wake event.
 func runStopHook(ctx context.Context, apiKey, bifrostURL string) {
-	target := wsURL(bifrostURL)
+	target := wsURL(bifrostURL, apiKey)
 	fmt.Fprintln(os.Stderr, "[bifrost-channel] --stop-hook", version, "→", target)
 
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
